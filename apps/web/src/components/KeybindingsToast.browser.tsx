@@ -123,6 +123,13 @@ function createBaseServerConfig(): ServerConfig {
           launchArgs: "",
         },
         cursor: { enabled: true, binaryPath: "", apiEndpoint: "", customModels: [] },
+        devin: {
+          enabled: true,
+          binaryPath: "",
+          configPath: "",
+          permissionMode: "ask",
+          customModels: [],
+        },
         opencode: {
           enabled: true,
           binaryPath: "",

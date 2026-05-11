@@ -28,6 +28,7 @@ import {
   type ClaudeSettings,
   type CodexSettings,
   type CursorSettings,
+  type DevinSettings,
   type OpenCodeSettings,
   ProviderDriverKind,
   type ProviderInstanceConfigMap,
@@ -41,6 +42,7 @@ import { ServerConfig } from "../../config.ts";
 import { ClaudeDriver } from "../Drivers/ClaudeDriver.ts";
 import { CodexDriver } from "../Drivers/CodexDriver.ts";
 import { CursorDriver } from "../Drivers/CursorDriver.ts";
+import { DevinDriver } from "../Drivers/DevinDriver.ts";
 import { OpenCodeDriver } from "../Drivers/OpenCodeDriver.ts";
 import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
@@ -84,6 +86,15 @@ const makeOpenCodeConfig = (overrides: Partial<OpenCodeSettings>): OpenCodeSetti
   binaryPath: "opencode",
   serverUrl: "",
   serverPassword: "",
+  customModels: [],
+  ...overrides,
+});
+
+const makeDevinConfig = (overrides: Partial<DevinSettings>): DevinSettings => ({
+  enabled: false,
+  binaryPath: "devin",
+  configPath: "",
+  permissionMode: "ask",
   customModels: [],
   ...overrides,
 });
@@ -244,11 +255,13 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       const codexId = ProviderInstanceId.make("codex_default");
       const claudeId = ProviderInstanceId.make("claude_default");
       const cursorId = ProviderInstanceId.make("cursor_default");
+      const devinId = ProviderInstanceId.make("devin_default");
       const openCodeId = ProviderInstanceId.make("opencode_default");
 
       const codexDriverKind = ProviderDriverKind.make("codex");
       const claudeDriverKind = ProviderDriverKind.make("claudeAgent");
       const cursorDriverKind = ProviderDriverKind.make("cursor");
+      const devinDriverKind = ProviderDriverKind.make("devin");
       const openCodeDriverKind = ProviderDriverKind.make("opencode");
 
       const configMap: ProviderInstanceConfigMap = {
@@ -273,6 +286,12 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
           enabled: false,
           config: makeCursorConfig({}),
         },
+        [devinId]: {
+          driver: devinDriverKind,
+          displayName: "Devin",
+          enabled: false,
+          config: makeDevinConfig({}),
+        },
         [openCodeId]: {
           driver: openCodeDriverKind,
           displayName: "OpenCode",
@@ -282,7 +301,7 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       };
 
       const { registry } = yield* makeProviderInstanceRegistry({
-        drivers: [CodexDriver, ClaudeDriver, CursorDriver, OpenCodeDriver],
+        drivers: [CodexDriver, ClaudeDriver, CursorDriver, DevinDriver, OpenCodeDriver],
         configMap,
       });
 
@@ -292,9 +311,9 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       expect(unavailable).toEqual([]);
 
       const instances = yield* registry.listInstances;
-      expect(instances).toHaveLength(4);
+      expect(instances).toHaveLength(5);
       expect(instances.map((instance) => instance.instanceId).toSorted()).toEqual(
-        [codexId, claudeId, cursorId, openCodeId].toSorted(),
+        [codexId, claudeId, cursorId, devinId, openCodeId].toSorted(),
       );
 
       // Instance lookup by id resolves each instance to its own bundle —
@@ -303,14 +322,17 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       const codex = yield* registry.getInstance(codexId);
       const claude = yield* registry.getInstance(claudeId);
       const cursor = yield* registry.getInstance(cursorId);
+      const devin = yield* registry.getInstance(devinId);
       const openCode = yield* registry.getInstance(openCodeId);
       expect(codex?.driverKind).toBe(codexDriverKind);
       expect(claude?.driverKind).toBe(claudeDriverKind);
       expect(cursor?.driverKind).toBe(cursorDriverKind);
+      expect(devin?.driverKind).toBe(devinDriverKind);
       expect(openCode?.driverKind).toBe(openCodeDriverKind);
       expect(codex?.displayName).toBe("Codex");
       expect(claude?.displayName).toBe("Claude");
       expect(cursor?.displayName).toBe("Cursor");
+      expect(devin?.displayName).toBe("Devin");
       expect(openCode?.displayName).toBe("OpenCode");
 
       // Every instance owns its own set of closures — no sharing across
@@ -318,16 +340,29 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       // distinct references even when two instances happen to share a
       // trait (e.g. Cursor + others all use a stub-or-real
       // `textGeneration`; they must still be different object values).
-      const adapters = [codex!.adapter, claude!.adapter, cursor!.adapter, openCode!.adapter];
+      const adapters = [
+        codex!.adapter,
+        claude!.adapter,
+        cursor!.adapter,
+        devin!.adapter,
+        openCode!.adapter,
+      ];
       expect(new Set(adapters).size).toBe(adapters.length);
       const textGenerations = [
         codex!.textGeneration,
         claude!.textGeneration,
         cursor!.textGeneration,
+        devin!.textGeneration,
         openCode!.textGeneration,
       ];
       expect(new Set(textGenerations).size).toBe(textGenerations.length);
-      const snapshots = [codex!.snapshot, claude!.snapshot, cursor!.snapshot, openCode!.snapshot];
+      const snapshots = [
+        codex!.snapshot,
+        claude!.snapshot,
+        cursor!.snapshot,
+        devin!.snapshot,
+        openCode!.snapshot,
+      ];
       expect(new Set(snapshots).size).toBe(snapshots.length);
 
       // Snapshots identify themselves by `instanceId` + `driver` so
@@ -355,6 +390,12 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
       expect(cursorSnapshot.continuation?.groupKey).toBe(
         `${cursorDriverKind}:instance:${cursorId}`,
       );
+
+      const devinSnapshot = yield* devin!.snapshot.getSnapshot;
+      expect(devinSnapshot.instanceId).toBe(devinId);
+      expect(devinSnapshot.driver).toBe(devinDriverKind);
+      expect(devinSnapshot.enabled).toBe(false);
+      expect(devinSnapshot.continuation?.groupKey).toBe(`${devinDriverKind}:instance:${devinId}`);
 
       const openCodeSnapshot = yield* openCode!.snapshot.getSnapshot;
       expect(openCodeSnapshot.instanceId).toBe(openCodeId);

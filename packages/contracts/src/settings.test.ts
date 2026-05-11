@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import * as Schema from "effect/Schema";
 
 import { ProviderInstanceId } from "./providerInstance.ts";
-import { DEFAULT_SERVER_SETTINGS, ServerSettings, ServerSettingsPatch } from "./settings.ts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  DevinSettings,
+  ServerSettings,
+  ServerSettingsPatch,
+} from "./settings.ts";
 
 const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
@@ -149,5 +154,46 @@ describe("ServerSettingsPatch string normalization", () => {
 
     expect(encoded.addProjectBaseDirectory).toBe("~/Development");
     expect(encoded.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
+  });
+});
+
+const decodeDevinSettings = Schema.decodeUnknownSync(DevinSettings);
+
+describe("DevinSettings", () => {
+  it("decodes with documented defaults", () => {
+    const decoded = decodeDevinSettings({});
+    expect(decoded.enabled).toBe(true);
+    expect(decoded.binaryPath).toBe("devin");
+    expect(decoded.configPath).toBe("");
+    expect(decoded.permissionMode).toBe("ask");
+    expect(decoded.customModels).toEqual([]);
+  });
+
+  it("accepts explicit values", () => {
+    const decoded = decodeDevinSettings({
+      enabled: false,
+      binaryPath: "/usr/local/bin/devin",
+      configPath: "~/.config/devin",
+      permissionMode: "auto",
+      customModels: ["custom-model"],
+    });
+    expect(decoded.enabled).toBe(false);
+    expect(decoded.binaryPath).toBe("/usr/local/bin/devin");
+    expect(decoded.configPath).toBe("~/.config/devin");
+    expect(decoded.permissionMode).toBe("auto");
+    expect(decoded.customModels).toEqual(["custom-model"]);
+  });
+
+  it("trims string fields while decoding", () => {
+    const decoded = decodeDevinSettings({
+      binaryPath: "  /usr/local/bin/devin  ",
+      configPath: "  ~/.config/devin  ",
+    });
+    expect(decoded.binaryPath).toBe("/usr/local/bin/devin");
+    expect(decoded.configPath).toBe("~/.config/devin");
+  });
+
+  it("rejects invalid permissionMode values", () => {
+    expect(() => decodeDevinSettings({ permissionMode: "invalid" })).toThrow();
   });
 });
