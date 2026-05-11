@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ProviderDriverKind, type ModelCapabilities } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 
-import { providerModelsFromSettings } from "./providerSnapshot.ts";
+import { buildServerProvider, providerModelsFromSettings } from "./providerSnapshot.ts";
 
 const OPENCODE_CUSTOM_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [
@@ -40,5 +40,58 @@ describe("providerModelsFromSettings", () => {
         capabilities: OPENCODE_CUSTOM_MODEL_CAPABILITIES,
       },
     ]);
+  });
+});
+
+describe("buildServerProvider", () => {
+  it("marks known incompatible provider harness versions as errors", () => {
+    const provider = buildServerProvider({
+      driver: ProviderDriverKind.make("codex"),
+      presentation: { displayName: "Codex" },
+      enabled: true,
+      checkedAt: "2026-04-10T00:00:00.000Z",
+      models: [],
+      probe: {
+        installed: true,
+        version: "0.128.0",
+        status: "ready",
+        auth: { status: "authenticated" },
+      },
+    });
+
+    expect(provider.status).toBe("error");
+    expect(provider.compatibilityAdvisory).toMatchObject({
+      status: "broken",
+      severity: "error",
+      currentVersion: "0.128.0",
+      recommendedRange: ">=0.129.0",
+      recommendedVersion: "0.129.0",
+    });
+    expect(provider.message).toContain("known to be incompatible");
+  });
+
+  it("keeps known supported provider harness versions ready", () => {
+    const provider = buildServerProvider({
+      driver: ProviderDriverKind.make("codex"),
+      presentation: { displayName: "Codex" },
+      enabled: true,
+      checkedAt: "2026-04-10T00:00:00.000Z",
+      models: [],
+      probe: {
+        installed: true,
+        version: "0.129.0",
+        status: "ready",
+        auth: { status: "authenticated" },
+      },
+    });
+
+    expect(provider.status).toBe("ready");
+    expect(provider.compatibilityAdvisory).toMatchObject({
+      status: "supported",
+      severity: "info",
+      currentVersion: "0.129.0",
+      recommendedVersion: "0.129.0",
+    });
+    expect(provider.message).toBeUndefined();
   });
 });

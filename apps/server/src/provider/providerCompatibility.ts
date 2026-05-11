@@ -1,0 +1,372 @@
+import {
+  ProviderDriverKind,
+  TrimmedNonEmptyString,
+  type ServerProvider,
+  type ServerProviderCompatibilityAdvisory,
+  type ServerProviderCompatibilityRange,
+} from "@t3tools/contracts";
+import { satisfiesSemverRange } from "@t3tools/shared/semver";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import { HttpClient, HttpClientRequest } from "effect/unstable/http";
+
+import packageJson from "../../package.json" with { type: "json" };
+
+export interface ProviderCompatibilityPolicy {
+  readonly t3CodeRange: string;
+  readonly driver: ProviderDriverKind;
+  readonly recommendedRange: string | null;
+  readonly recommendedVersion?: string | null;
+  readonly ranges: ReadonlyArray<ServerProviderCompatibilityRange>;
+}
+
+export interface ProviderCompatibilityDocument {
+  readonly version: 1;
+  readonly policies: ReadonlyArray<ProviderCompatibilityPolicy>;
+}
+
+interface RemoteCompatibilityCacheEntry {
+  readonly expiresAt: number;
+  readonly document: ProviderCompatibilityDocument | null;
+}
+
+type ProviderCompatibilitySnapshot = Pick<ServerProvider, "enabled" | "status" | "message"> & {
+  readonly compatibilityAdvisory?: ServerProviderCompatibilityAdvisory | undefined;
+};
+
+const CODEX_DRIVER = ProviderDriverKind.make("codex");
+const T3_CODE_VERSION = packageJson.version;
+const REMOTE_COMPATIBILITY_CACHE_TTL_MS = 15 * 60 * 1_000;
+const REMOTE_COMPATIBILITY_TIMEOUT_MS = 2_500;
+
+export const DEFAULT_PROVIDER_COMPATIBILITY_MAP_URL =
+  "https://raw.githubusercontent.com/pingdotgg/t3code/main/provider-compatibility.v1.json";
+
+const remoteCompatibilityCache = new Map<string, RemoteCompatibilityCacheEntry>();
+
+const RemoteCompatibilityRange = Schema.Struct({
+  status: Schema.Literals(["unknown", "supported", "graceful", "unsupported", "broken"]),
+  range: TrimmedNonEmptyString,
+  label: Schema.optional(TrimmedNonEmptyString),
+});
+
+const RemoteCompatibilityPolicy = Schema.Struct({
+  t3CodeRange: TrimmedNonEmptyString,
+  driver: TrimmedNonEmptyString,
+  recommendedRange: Schema.NullOr(TrimmedNonEmptyString),
+  recommendedVersion: Schema.optionalKey(Schema.NullOr(TrimmedNonEmptyString)),
+  ranges: Schema.Array(RemoteCompatibilityRange),
+});
+
+const RemoteCompatibilityDocument = Schema.Struct({
+  version: Schema.Literal(1),
+  policies: Schema.Array(RemoteCompatibilityPolicy),
+});
+
+const decodeRemoteCompatibilityDocument = Schema.decodeUnknownEffect(RemoteCompatibilityDocument);
+
+/**
+ * Bundled fallback harness compatibility map.
+ *
+ * The hosted JSON document at `DEFAULT_PROVIDER_COMPATIBILITY_MAP_URL` is the
+ * maintainer-overridable source. Keep this bundled map conservative so old
+ * installs still have useful behavior when offline or when GitHub is down.
+ */
+export const BUNDLED_PROVIDER_COMPATIBILITY_DOCUMENT: ProviderCompatibilityDocument = {
+  version: 1,
+  policies: [
+    {
+      t3CodeRange: ">=0.0.0",
+      driver: CODEX_DRIVER,
+      recommendedRange: ">=0.129.0",
+      recommendedVersion: "0.129.0",
+      ranges: [
+        {
+          status: "supported",
+          range: ">=0.129.0",
+          label: "Known working Codex app-server harness",
+        },
+        {
+          status: "broken",
+          range: "<0.129.0",
+          label: "Known incompatible Codex app-server harness",
+        },
+      ],
+    },
+  ],
+};
+
+export function clearProviderCompatibilityCacheForTests(): void {
+  remoteCompatibilityCache.clear();
+}
+
+function remoteCompatibilityMapUrl(): string {
+  return (
+    process.env.T3_PROVIDER_COMPATIBILITY_MAP_URL?.trim() || DEFAULT_PROVIDER_COMPATIBILITY_MAP_URL
+  );
+}
+
+function normalizeRemoteDocument(
+  document: typeof RemoteCompatibilityDocument.Type,
+): ProviderCompatibilityDocument {
+  return {
+    version: document.version,
+    policies: document.policies.map((policy) => ({
+      t3CodeRange: policy.t3CodeRange,
+      driver: ProviderDriverKind.make(policy.driver),
+      recommendedRange: policy.recommendedRange,
+      ...(policy.recommendedVersion !== undefined
+        ? { recommendedVersion: policy.recommendedVersion }
+        : {}),
+      ranges: policy.ranges.map((range) => ({
+        status: range.status,
+        range: range.range,
+        ...(range.label !== undefined ? { label: range.label } : {}),
+      })),
+    })),
+  };
+}
+
+function policyMatches(input: {
+  readonly policy: ProviderCompatibilityPolicy;
+  readonly driver: ProviderDriverKind;
+  readonly t3CodeVersion: string;
+}): boolean {
+  return (
+    input.policy.driver === input.driver &&
+    satisfiesSemverRange(input.t3CodeVersion, input.policy.t3CodeRange)
+  );
+}
+
+function compatibilityPolicyForDriver(input: {
+  readonly document: ProviderCompatibilityDocument;
+  readonly driver: ProviderDriverKind;
+  readonly t3CodeVersion?: string;
+}): ProviderCompatibilityPolicy | null {
+  const t3CodeVersion = input.t3CodeVersion ?? T3_CODE_VERSION;
+  return (
+    input.document.policies.find((policy) =>
+      policyMatches({ policy, driver: input.driver, t3CodeVersion }),
+    ) ?? null
+  );
+}
+
+function severityForStatus(
+  status: ServerProviderCompatibilityAdvisory["status"],
+): ServerProviderCompatibilityAdvisory["severity"] {
+  switch (status) {
+    case "broken":
+      return "error";
+    case "unsupported":
+    case "graceful":
+      return "warning";
+    case "supported":
+    case "unknown":
+      return "info";
+  }
+}
+
+function messageForStatus(input: {
+  readonly status: ServerProviderCompatibilityAdvisory["status"];
+  readonly currentVersion: string | null;
+  readonly recommendedRange: string | null;
+  readonly recommendedVersion: string | null;
+}) {
+  const current = input.currentVersion ? ` ${input.currentVersion}` : "";
+  const recommendedTarget = input.recommendedVersion ?? input.recommendedRange;
+  const recommended = recommendedTarget ? ` Use ${recommendedTarget}.` : "";
+  switch (input.status) {
+    case "broken":
+      return `This provider harness version${current} is known to be incompatible with this T3 Code release.${recommended}`;
+    case "unsupported":
+      return `This provider harness version${current} is outside the compatibility range for this T3 Code release.${recommended}`;
+    case "graceful":
+      return `This provider harness version${current} should still work, but updating is recommended.${recommended}`;
+    case "unknown":
+      return `T3 Code could not determine whether this provider harness version is compatible.${recommended}`;
+    case "supported":
+      return null;
+  }
+}
+
+function createProviderCompatibilityAdvisoryFromDocument(input: {
+  readonly document: ProviderCompatibilityDocument;
+  readonly driver: ProviderDriverKind;
+  readonly currentVersion: string | null;
+  readonly t3CodeVersion?: string;
+}): ServerProviderCompatibilityAdvisory | undefined {
+  const policy = compatibilityPolicyForDriver({
+    document: input.document,
+    driver: input.driver,
+    ...(input.t3CodeVersion ? { t3CodeVersion: input.t3CodeVersion } : {}),
+  });
+  if (!policy) {
+    return undefined;
+  }
+
+  const currentVersion = input.currentVersion;
+  const matchedRange =
+    currentVersion === null
+      ? undefined
+      : policy.ranges.find((range) => satisfiesSemverRange(currentVersion, range.range));
+  const status = matchedRange?.status ?? (currentVersion === null ? "unknown" : "unsupported");
+  const recommendedVersion = policy.recommendedVersion ?? null;
+
+  return {
+    status,
+    severity: severityForStatus(status),
+    currentVersion: input.currentVersion,
+    message: messageForStatus({
+      status,
+      currentVersion: input.currentVersion,
+      recommendedRange: policy.recommendedRange,
+      recommendedVersion,
+    }),
+    recommendedRange: policy.recommendedRange,
+    recommendedVersion,
+    ranges: [...policy.ranges],
+  };
+}
+
+export function createProviderCompatibilityAdvisory(input: {
+  readonly driver: ProviderDriverKind;
+  readonly currentVersion: string | null;
+  readonly document?: ProviderCompatibilityDocument;
+  readonly t3CodeVersion?: string;
+}): ServerProviderCompatibilityAdvisory | undefined {
+  return createProviderCompatibilityAdvisoryFromDocument({
+    document: input.document ?? BUNDLED_PROVIDER_COMPATIBILITY_DOCUMENT,
+    driver: input.driver,
+    currentVersion: input.currentVersion,
+    ...(input.t3CodeVersion ? { t3CodeVersion: input.t3CodeVersion } : {}),
+  });
+}
+
+function fetchRemoteCompatibilityDocument(
+  url: string,
+): Effect.Effect<ProviderCompatibilityDocument | null, never, HttpClient.HttpClient> {
+  return Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient;
+    const response = yield* client
+      .execute(
+        HttpClientRequest.get(url).pipe(
+          HttpClientRequest.setHeader("accept", "application/json"),
+          HttpClientRequest.setHeader("user-agent", `t3code/${T3_CODE_VERSION}`),
+        ),
+      )
+      .pipe(Effect.timeoutOption(REMOTE_COMPATIBILITY_TIMEOUT_MS));
+
+    if (Option.isNone(response)) {
+      return null;
+    }
+
+    const httpResponse = response.value;
+    if (httpResponse.status < 200 || httpResponse.status >= 300) {
+      return null;
+    }
+
+    const payload = yield* httpResponse.json.pipe(
+      Effect.flatMap(decodeRemoteCompatibilityDocument),
+      Effect.map(normalizeRemoteDocument),
+      Effect.catch(() => Effect.succeed(null)),
+    );
+    return payload;
+  }).pipe(
+    Effect.tapError((cause) =>
+      Effect.logWarning("provider compatibility map fetch failed", {
+        cause,
+        url,
+      }),
+    ),
+    Effect.catch(() => Effect.succeed(null)),
+  );
+}
+
+export const resolveRemoteProviderCompatibilityDocument = Effect.fn(
+  "resolveRemoteProviderCompatibilityDocument",
+)(function* () {
+  const url = remoteCompatibilityMapUrl();
+  const now = DateTime.toEpochMillis(yield* DateTime.now);
+  const cached = remoteCompatibilityCache.get(url);
+  if (cached && cached.expiresAt > now) {
+    return cached.document;
+  }
+
+  const document = yield* fetchRemoteCompatibilityDocument(url);
+  remoteCompatibilityCache.set(url, {
+    expiresAt: now + REMOTE_COMPATIBILITY_CACHE_TTL_MS,
+    document,
+  });
+  return document;
+});
+
+function applyCompatibilityAdvisory<Snapshot extends ProviderCompatibilitySnapshot>(
+  snapshot: Snapshot,
+  compatibilityAdvisory: ServerProviderCompatibilityAdvisory | undefined,
+): Snapshot {
+  if (!compatibilityAdvisory) {
+    const { compatibilityAdvisory: _omit, ...snapshotWithoutAdvisory } = snapshot;
+    return snapshotWithoutAdvisory as Snapshot;
+  }
+
+  const compatibilityMessage =
+    compatibilityAdvisory.severity !== "info"
+      ? (compatibilityAdvisory.message ?? undefined)
+      : undefined;
+  const status =
+    snapshot.enabled && compatibilityAdvisory.severity === "error"
+      ? "error"
+      : snapshot.enabled &&
+          compatibilityAdvisory.severity === "warning" &&
+          snapshot.status === "ready"
+        ? "warning"
+        : snapshot.status;
+
+  return {
+    ...snapshot,
+    status,
+    ...(compatibilityMessage || snapshot.message
+      ? { message: compatibilityMessage ?? snapshot.message }
+      : {}),
+    compatibilityAdvisory,
+  } as Snapshot;
+}
+
+export function applyBundledProviderCompatibilityAdvisory<
+  Snapshot extends ProviderCompatibilitySnapshot,
+>(input: {
+  readonly snapshot: Snapshot;
+  readonly driver: ProviderDriverKind;
+  readonly currentVersion: string | null;
+}): Snapshot {
+  return applyCompatibilityAdvisory(
+    input.snapshot,
+    createProviderCompatibilityAdvisory({
+      driver: input.driver,
+      currentVersion: input.currentVersion,
+    }),
+  );
+}
+
+export const enrichProviderSnapshotWithCompatibilityAdvisory = Effect.fn(
+  "enrichProviderSnapshotWithCompatibilityAdvisory",
+)(function* (snapshot: ServerProvider) {
+  const remoteDocument = yield* resolveRemoteProviderCompatibilityDocument();
+  const remoteAdvisory = remoteDocument
+    ? createProviderCompatibilityAdvisory({
+        driver: snapshot.driver,
+        currentVersion: snapshot.version,
+        document: remoteDocument,
+      })
+    : undefined;
+  const advisory =
+    remoteAdvisory ??
+    createProviderCompatibilityAdvisory({
+      driver: snapshot.driver,
+      currentVersion: snapshot.version,
+    });
+
+  return applyCompatibilityAdvisory(snapshot, advisory);
+});

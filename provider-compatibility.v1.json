@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "policies": [
+    {
+      "t3CodeRange": ">=0.0.0",
+      "driver": "codex",
+      "recommendedRange": ">=0.129.0",
+      "recommendedVersion": "0.129.0",
+      "ranges": [
+        {
+          "status": "supported",
+          "range": ">=0.129.0",
+          "label": "Known working Codex app-server harness"
+        },
+        {
+          "status": "broken",
+          "range": "<0.129.0",
+          "label": "Known incompatible Codex app-server harness"
+        }
+      ]
+    }
+  ]
+}
