@@ -34,6 +34,8 @@ import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
+  makeAcpPlanUpdatedEvent,
+  makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { makeDevinAcpRuntime } from "../acp/DevinAcpSupport.ts";
 import { type DevinAdapterShape } from "../Services/DevinAdapter.ts";
@@ -266,6 +268,32 @@ export function makeDevinAdapter(
                       turnId: ctx.activeTurnId,
                       ...(event.itemId ? { itemId: event.itemId } : {}),
                       text: event.text,
+                      rawPayload: event.rawPayload,
+                    }),
+                  );
+                  return;
+                case "PlanUpdated":
+                  yield* offerRuntimeEvent(
+                    makeAcpPlanUpdatedEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: ctx.threadId,
+                      turnId: ctx.activeTurnId,
+                      payload: event.payload,
+                      source: "acp.jsonrpc",
+                      method: "session/update",
+                      rawPayload: event.rawPayload,
+                    }),
+                  );
+                  return;
+                case "ToolCallUpdated":
+                  yield* offerRuntimeEvent(
+                    makeAcpToolCallEvent({
+                      stamp: yield* makeEventStamp(),
+                      provider: PROVIDER,
+                      threadId: ctx.threadId,
+                      turnId: ctx.activeTurnId,
+                      toolCall: event.toolCall,
                       rawPayload: event.rawPayload,
                     }),
                   );

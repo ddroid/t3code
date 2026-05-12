@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -104,7 +105,7 @@ devinAdapterTestLayer("DevinAdapterLive", (it) => {
       const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
       yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 8).pipe(
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 9).pipe(
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -136,12 +137,22 @@ devinAdapterTestLayer("DevinAdapterLive", (it) => {
         "session.state.changed",
         "thread.started",
         "turn.started",
+        "turn.plan.updated",
         "item.started",
         "content.delta",
         "item.completed",
         "turn.completed",
       ] as const) {
         assert.include(types, t);
+      }
+
+      const planUpdated = runtimeEvents.find((e) => e.type === "turn.plan.updated");
+      assert.isDefined(planUpdated);
+      if (planUpdated?.type === "turn.plan.updated") {
+        assert.deepStrictEqual(planUpdated.payload.plan, [
+          { step: "Inspect mock ACP state", status: "completed" },
+          { step: "Implement the requested change", status: "inProgress" },
+        ]);
       }
 
       const assistantStarted = runtimeEvents.find(
@@ -275,6 +286,258 @@ devinAdapterTestLayer("DevinAdapterLive", (it) => {
 
       yield* adapter.stopSession(threadIdA);
       yield* adapter.stopSession(threadIdB);
+    }),
+  );
+
+  it.effect("emits ACP tool lifecycle events for command execution", () =>
+    Effect.gen(function* () {
+      const ctx = yield* DevinTestContextService;
+      const adapter = ctx.adapter;
+      const threadId = ThreadId.make("devin-tool-call-cmd");
+      const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+      const settledEventsReady = yield* Deferred.make<void>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_EMIT_TOOL_CALLS: "1" }),
+      );
+      yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          runtimeEvents.push(event);
+          if (String(event.threadId) !== String(threadId)) return;
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "run a command",
+        attachments: [],
+      });
+
+      yield* Deferred.await(settledEventsReady);
+
+      const threadEvents = runtimeEvents.filter(
+        (event) => String(event.threadId) === String(threadId),
+      );
+      assert.includeMembers(
+        threadEvents.map((event) => event.type),
+        [
+          "session.started",
+          "session.state.changed",
+          "thread.started",
+          "turn.started",
+          "item.updated",
+          "item.completed",
+          "content.delta",
+          "turn.completed",
+        ],
+      );
+
+      const turnEvents = threadEvents.filter(
+        (event) => String(event.turnId) === String(turn.turnId),
+      );
+
+      const toolUpdates = turnEvents.filter((event) => event.type === "item.updated");
+      assert.isAtLeast(toolUpdates.length, 1);
+      for (const toolUpdate of toolUpdates) {
+        if (toolUpdate.type !== "item.updated") continue;
+        assert.equal(toolUpdate.payload.itemType, "command_execution");
+        assert.equal(toolUpdate.payload.status, "inProgress");
+        assert.equal(toolUpdate.payload.detail, "cat server/package.json");
+        assert.equal(String(toolUpdate.itemId), "tool-call-1");
+      }
+
+      const toolCompleted = turnEvents.find(
+        (event) =>
+          event.type === "item.completed" && event.payload.itemType === "command_execution",
+      );
+      assert.isDefined(toolCompleted);
+      if (toolCompleted?.type === "item.completed") {
+        assert.equal(String(toolCompleted.turnId), String(turn.turnId));
+        assert.equal(toolCompleted.payload.itemType, "command_execution");
+        assert.equal(toolCompleted.payload.status, "completed");
+        assert.equal(toolCompleted.payload.detail, "cat server/package.json");
+        assert.equal(String(toolCompleted.itemId), "tool-call-1");
+      }
+
+      const contentDelta = turnEvents.find((event) => event.type === "content.delta");
+      assert.isDefined(contentDelta);
+      if (contentDelta?.type === "content.delta") {
+        assert.equal(String(contentDelta.turnId), String(turn.turnId));
+        assert.equal(contentDelta.payload.delta, "hello from mock");
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("emits ACP tool lifecycle events for generic tool calls", () =>
+    Effect.gen(function* () {
+      const ctx = yield* DevinTestContextService;
+      const adapter = ctx.adapter;
+      const threadId = ThreadId.make("devin-tool-call-generic");
+      const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+      const settledEventsReady = yield* Deferred.make<void>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS: "1" }),
+      );
+      yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          runtimeEvents.push(event);
+          if (String(event.threadId) !== String(threadId)) return;
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "run a generic tool",
+        attachments: [],
+      });
+
+      yield* Deferred.await(settledEventsReady);
+
+      const threadEvents = runtimeEvents.filter(
+        (event) => String(event.threadId) === String(threadId),
+      );
+      assert.includeMembers(
+        threadEvents.map((event) => event.type),
+        [
+          "session.started",
+          "session.state.changed",
+          "thread.started",
+          "turn.started",
+          "item.completed",
+          "turn.completed",
+        ],
+      );
+
+      const turnEvents = threadEvents.filter(
+        (event) => String(event.turnId) === String(turn.turnId),
+      );
+
+      const toolCompleted = turnEvents.find(
+        (event) =>
+          event.type === "item.completed" && event.payload.itemType === "dynamic_tool_call",
+      );
+      assert.isDefined(toolCompleted);
+      if (toolCompleted?.type === "item.completed") {
+        assert.equal(String(toolCompleted.turnId), String(turn.turnId));
+        assert.equal(toolCompleted.payload.itemType, "dynamic_tool_call");
+        assert.equal(toolCompleted.payload.status, "completed");
+        assert.equal(toolCompleted.payload.title, "Read file");
+        assert.equal(String(toolCompleted.itemId), "tool-call-generic-1");
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("emits interleaved assistant and tool lifecycle events", () =>
+    Effect.gen(function* () {
+      const ctx = yield* DevinTestContextService;
+      const adapter = ctx.adapter;
+      const threadId = ThreadId.make("devin-interleaved-tool");
+      const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+      const settledEventsReady = yield* Deferred.make<void>();
+
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockAgentWrapper({ T3_ACP_EMIT_INTERLEAVED_ASSISTANT_TOOL_CALLS: "1" }),
+      );
+      yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          runtimeEvents.push(event);
+          if (String(event.threadId) !== String(threadId)) return;
+          if (event.type === "turn.completed") {
+            yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "interleaved test",
+        attachments: [],
+      });
+
+      yield* Deferred.await(settledEventsReady);
+
+      const threadEvents = runtimeEvents.filter(
+        (event) => String(event.threadId) === String(threadId),
+      );
+      assert.includeMembers(
+        threadEvents.map((event) => event.type),
+        [
+          "session.started",
+          "session.state.changed",
+          "thread.started",
+          "turn.started",
+          "item.started",
+          "content.delta",
+          "item.updated",
+          "item.completed",
+          "content.delta",
+          "item.completed",
+          "turn.completed",
+        ],
+      );
+
+      const turnEvents = threadEvents.filter(
+        (event) => String(event.turnId) === String(turn.turnId),
+      );
+
+      const toolCompleted = turnEvents.find(
+        (event) =>
+          event.type === "item.completed" && event.payload.itemType === "command_execution",
+      );
+      assert.isDefined(toolCompleted);
+      if (toolCompleted?.type === "item.completed") {
+        assert.equal(toolCompleted.payload.itemType, "command_execution");
+        assert.equal(toolCompleted.payload.status, "completed");
+        assert.equal(toolCompleted.payload.detail, "echo hello");
+        assert.equal(String(toolCompleted.itemId), "tool-call-1");
+      }
+
+      const deltas = turnEvents.filter((event) => event.type === "content.delta");
+      assert.isAtLeast(deltas.length, 1);
+      const firstDelta = deltas[0];
+      if (firstDelta?.type === "content.delta") {
+        assert.equal(firstDelta.payload.delta, "before tool");
+      }
+
+      yield* adapter.stopSession(threadId);
     }),
   );
 });
