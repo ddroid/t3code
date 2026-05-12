@@ -15,7 +15,13 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
-import { DevinSettings, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  DevinSettings,
+  ProviderDriverKind,
+  RuntimeRequestId,
+  ThreadId,
+} from "@t3tools/contracts";
 
 import { makeDevinAdapter } from "./DevinAdapter.ts";
 import type { DevinAdapterShape } from "../Services/DevinAdapter.ts";
@@ -289,25 +295,308 @@ devinAdapterTestLayer("DevinAdapterLive", (it) => {
     }),
   );
 
-  it.effect("emits ACP tool lifecycle events for command execution", () =>
+  it.effect(
+    "emits ACP tool lifecycle events for command execution with auto-approved permission mode",
+    () =>
+      Effect.gen(function* () {
+        const ctx = yield* DevinTestContextService;
+        const adapter = ctx.adapter;
+        const threadId = ThreadId.make("devin-tool-call-cmd");
+        const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+        const settledEventsReady = yield* Deferred.make<void>();
+
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({ T3_ACP_EMIT_TOOL_CALLS: "1" }),
+        );
+        yield* ctx.updateSettings(
+          decodeDevinSettings({ binaryPath: wrapperPath, permissionMode: "auto" }),
+        );
+
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            runtimeEvents.push(event);
+            if (String(event.threadId) !== String(threadId)) return;
+            if (event.type === "turn.completed") {
+              yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+            }
+          }),
+        ).pipe(Effect.forkChild);
+
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("devin"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "run a command",
+          attachments: [],
+        });
+
+        yield* Deferred.await(settledEventsReady);
+
+        const threadEvents = runtimeEvents.filter(
+          (event) => String(event.threadId) === String(threadId),
+        );
+        assert.includeMembers(
+          threadEvents.map((event) => event.type),
+          [
+            "session.started",
+            "session.state.changed",
+            "thread.started",
+            "turn.started",
+            "item.updated",
+            "item.completed",
+            "content.delta",
+            "turn.completed",
+          ],
+        );
+
+        const turnEvents = threadEvents.filter(
+          (event) => String(event.turnId) === String(turn.turnId),
+        );
+
+        const toolUpdates = turnEvents.filter((event) => event.type === "item.updated");
+        assert.isAtLeast(toolUpdates.length, 1);
+        for (const toolUpdate of toolUpdates) {
+          if (toolUpdate.type !== "item.updated") continue;
+          assert.equal(toolUpdate.payload.itemType, "command_execution");
+          assert.equal(toolUpdate.payload.status, "inProgress");
+          assert.equal(toolUpdate.payload.detail, "cat server/package.json");
+          assert.equal(String(toolUpdate.itemId), "tool-call-1");
+        }
+
+        const toolCompleted = turnEvents.find(
+          (event) =>
+            event.type === "item.completed" && event.payload.itemType === "command_execution",
+        );
+        assert.isDefined(toolCompleted);
+        if (toolCompleted?.type === "item.completed") {
+          assert.equal(String(toolCompleted.turnId), String(turn.turnId));
+          assert.equal(toolCompleted.payload.itemType, "command_execution");
+          assert.equal(toolCompleted.payload.status, "completed");
+          assert.equal(toolCompleted.payload.detail, "cat server/package.json");
+          assert.equal(String(toolCompleted.itemId), "tool-call-1");
+        }
+
+        const contentDelta = turnEvents.find((event) => event.type === "content.delta");
+        assert.isDefined(contentDelta);
+        if (contentDelta?.type === "content.delta") {
+          assert.equal(String(contentDelta.turnId), String(turn.turnId));
+          assert.equal(contentDelta.payload.delta, "hello from mock");
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect(
+    "emits approval request events and resolves when respondToRequest is called with accept",
+    () =>
+      Effect.gen(function* () {
+        const ctx = yield* DevinTestContextService;
+        const adapter = ctx.adapter;
+        const threadId = ThreadId.make("devin-approval-accept");
+        const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+        const settledEventsReady = yield* Deferred.make<void>();
+
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({ T3_ACP_EMIT_TOOL_CALLS: "1" }),
+        );
+        yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            runtimeEvents.push(event);
+            if (String(event.threadId) !== String(threadId)) return;
+            if (event.type === "request.opened" && event.requestId) {
+              yield* adapter.respondToRequest(
+                threadId,
+                ApprovalRequestId.make(String(event.requestId)),
+                "accept",
+              );
+            }
+            if (event.type === "turn.completed") {
+              yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+            }
+          }),
+        ).pipe(Effect.forkChild);
+
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("devin"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "run a command",
+          attachments: [],
+        });
+
+        yield* Deferred.await(settledEventsReady);
+
+        const threadEvents = runtimeEvents.filter(
+          (event) => String(event.threadId) === String(threadId),
+        );
+        assert.includeMembers(
+          threadEvents.map((event) => event.type),
+          [
+            "session.started",
+            "session.state.changed",
+            "thread.started",
+            "turn.started",
+            "request.opened",
+            "request.resolved",
+            "item.updated",
+            "item.completed",
+            "content.delta",
+            "turn.completed",
+          ],
+        );
+
+        const turnEvents = threadEvents.filter(
+          (event) => String(event.turnId) === String(turn.turnId),
+        );
+
+        const requestOpened = turnEvents.find((event) => event.type === "request.opened");
+        assert.isDefined(requestOpened);
+        if (requestOpened?.type === "request.opened") {
+          assert.equal(String(requestOpened.turnId), String(turn.turnId));
+          assert.equal(requestOpened.payload.requestType, "exec_command_approval");
+          assert.equal(requestOpened.payload.detail, "cat server/package.json");
+        }
+
+        const requestResolved = turnEvents.find((event) => event.type === "request.resolved");
+        assert.isDefined(requestResolved);
+        if (requestResolved?.type === "request.resolved") {
+          assert.equal(String(requestResolved.turnId), String(turn.turnId));
+          assert.equal(requestResolved.payload.requestType, "exec_command_approval");
+          assert.equal(requestResolved.payload.decision, "accept");
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect(
+    "emits approval request events and resolves when respondToRequest is called with decline",
+    () =>
+      Effect.gen(function* () {
+        const ctx = yield* DevinTestContextService;
+        const adapter = ctx.adapter;
+        const threadId = ThreadId.make("devin-approval-decline");
+        const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
+        const settledEventsReady = yield* Deferred.make<void>();
+
+        const wrapperPath = yield* Effect.promise(() =>
+          makeMockAgentWrapper({ T3_ACP_EMIT_TOOL_CALLS: "1" }),
+        );
+        yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            runtimeEvents.push(event);
+            if (String(event.threadId) !== String(threadId)) return;
+            if (event.type === "request.opened" && event.requestId) {
+              yield* adapter.respondToRequest(
+                threadId,
+                ApprovalRequestId.make(String(event.requestId)),
+                "decline",
+              );
+            }
+            if (event.type === "turn.completed") {
+              yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+            }
+          }),
+        ).pipe(Effect.forkChild);
+
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("devin"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "run a command",
+          attachments: [],
+        });
+
+        yield* Deferred.await(settledEventsReady);
+
+        const threadEvents = runtimeEvents.filter(
+          (event) => String(event.threadId) === String(threadId),
+        );
+
+        const requestResolved = threadEvents.find((event) => event.type === "request.resolved");
+        assert.isDefined(requestResolved);
+        if (requestResolved?.type === "request.resolved") {
+          assert.equal(requestResolved.payload.decision, "decline");
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect("fails respondToRequest for an unknown request id", () =>
     Effect.gen(function* () {
       const ctx = yield* DevinTestContextService;
       const adapter = ctx.adapter;
-      const threadId = ThreadId.make("devin-tool-call-cmd");
-      const runtimeEvents: Array<import("@t3tools/contracts").ProviderRuntimeEvent> = [];
-      const settledEventsReady = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("devin-stale-request");
+
+      const wrapperPath = yield* Effect.promise(() => makeMockAgentWrapper());
+      yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("devin"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const result = yield* adapter
+        .respondToRequest(threadId, ApprovalRequestId.make("nonexistent-request-id"), "accept")
+        .pipe(Effect.result);
+
+      assert.equal(result._tag, "Failure");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("cancels pending approvals and marks the turn cancelled when interrupted", () =>
+    Effect.gen(function* () {
+      const ctx = yield* DevinTestContextService;
+      const adapter = ctx.adapter;
+      const threadId = ThreadId.make("devin-interrupt-probe");
+      const requestResolvedReady = yield* Deferred.make<void>();
+      const turnCompletedReady = yield* Deferred.make<void>();
+      let interrupted = false;
 
       const wrapperPath = yield* Effect.promise(() =>
         makeMockAgentWrapper({ T3_ACP_EMIT_TOOL_CALLS: "1" }),
       );
       yield* ctx.updateSettings(decodeDevinSettings({ binaryPath: wrapperPath }));
 
-      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
         Effect.gen(function* () {
-          runtimeEvents.push(event);
           if (String(event.threadId) !== String(threadId)) return;
+          if (event.type === "request.opened" && !interrupted) {
+            interrupted = true;
+            yield* adapter.interruptTurn(threadId);
+            return;
+          }
+          if (event.type === "request.resolved") {
+            yield* Deferred.succeed(requestResolvedReady, undefined).pipe(Effect.ignore);
+            return;
+          }
           if (event.type === "turn.completed") {
-            yield* Deferred.succeed(settledEventsReady, undefined).pipe(Effect.orDie);
+            yield* Deferred.succeed(turnCompletedReady, undefined).pipe(Effect.ignore);
           }
         }),
       ).pipe(Effect.forkChild);
@@ -319,64 +608,18 @@ devinAdapterTestLayer("DevinAdapterLive", (it) => {
         runtimeMode: "full-access",
       });
 
-      const turn = yield* adapter.sendTurn({
-        threadId,
-        input: "run a command",
-        attachments: [],
-      });
+      const sendTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "run a command",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
 
-      yield* Deferred.await(settledEventsReady);
-
-      const threadEvents = runtimeEvents.filter(
-        (event) => String(event.threadId) === String(threadId),
-      );
-      assert.includeMembers(
-        threadEvents.map((event) => event.type),
-        [
-          "session.started",
-          "session.state.changed",
-          "thread.started",
-          "turn.started",
-          "item.updated",
-          "item.completed",
-          "content.delta",
-          "turn.completed",
-        ],
-      );
-
-      const turnEvents = threadEvents.filter(
-        (event) => String(event.turnId) === String(turn.turnId),
-      );
-
-      const toolUpdates = turnEvents.filter((event) => event.type === "item.updated");
-      assert.isAtLeast(toolUpdates.length, 1);
-      for (const toolUpdate of toolUpdates) {
-        if (toolUpdate.type !== "item.updated") continue;
-        assert.equal(toolUpdate.payload.itemType, "command_execution");
-        assert.equal(toolUpdate.payload.status, "inProgress");
-        assert.equal(toolUpdate.payload.detail, "cat server/package.json");
-        assert.equal(String(toolUpdate.itemId), "tool-call-1");
-      }
-
-      const toolCompleted = turnEvents.find(
-        (event) =>
-          event.type === "item.completed" && event.payload.itemType === "command_execution",
-      );
-      assert.isDefined(toolCompleted);
-      if (toolCompleted?.type === "item.completed") {
-        assert.equal(String(toolCompleted.turnId), String(turn.turnId));
-        assert.equal(toolCompleted.payload.itemType, "command_execution");
-        assert.equal(toolCompleted.payload.status, "completed");
-        assert.equal(toolCompleted.payload.detail, "cat server/package.json");
-        assert.equal(String(toolCompleted.itemId), "tool-call-1");
-      }
-
-      const contentDelta = turnEvents.find((event) => event.type === "content.delta");
-      assert.isDefined(contentDelta);
-      if (contentDelta?.type === "content.delta") {
-        assert.equal(String(contentDelta.turnId), String(turn.turnId));
-        assert.equal(contentDelta.payload.delta, "hello from mock");
-      }
+      yield* Deferred.await(requestResolvedReady);
+      yield* Deferred.await(turnCompletedReady);
+      yield* Fiber.join(sendTurnFiber);
+      yield* Fiber.interrupt(runtimeEventsFiber);
 
       yield* adapter.stopSession(threadId);
     }),

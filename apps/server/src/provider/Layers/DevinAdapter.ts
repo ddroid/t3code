@@ -4,15 +4,19 @@
  * @module DevinAdapterLive
  */
 import {
+  ApprovalRequestId,
   EventId,
+  type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
   type ProviderSession,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeRequestId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -29,15 +33,18 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
-import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import { acpPermissionOutcome, mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import { type AcpSessionRuntimeShape } from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
   makeAcpPlanUpdatedEvent,
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { makeDevinAcpRuntime } from "../acp/DevinAcpSupport.ts";
+import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
 import { type DevinAdapterShape } from "../Services/DevinAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -57,6 +64,22 @@ export interface DevinAdapterLiveOptions {
   readonly resolveSettings?: Effect.Effect<import("@t3tools/contracts").DevinSettings>;
 }
 
+interface PendingApproval {
+  readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+  readonly kind: string | "unknown";
+}
+
+function settlePendingApprovalsAsCancelled(
+  pendingApprovals: ReadonlyMap<ApprovalRequestId, PendingApproval>,
+): Effect.Effect<void> {
+  const pendingEntries = Array.from(pendingApprovals.values());
+  return Effect.forEach(
+    pendingEntries,
+    (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
+    { discard: true },
+  );
+}
+
 interface DevinSessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
@@ -64,6 +87,7 @@ interface DevinSessionContext {
   readonly acp: AcpSessionRuntimeShape;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   activeTurnId: TurnId | undefined;
   stopped: boolean;
 }
@@ -111,6 +135,7 @@ export function makeDevinAdapter(
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
@@ -177,21 +202,69 @@ export function makeDevinAdapter(
           ),
         );
 
+        const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
+
         yield* acp.handleRequestPermission((request) =>
-          Effect.sync(() => {
-            const allowAlwaysOption = request.options.find(
-              (option) => option.kind === "allow_always",
+          Effect.gen(function* () {
+            const permissionMode = effectiveDevinSettings.permissionMode ?? "ask";
+            if (permissionMode === "auto") {
+              const allowOnceOption = request.options.find(
+                (option) => option.kind === "allow_once",
+              );
+              const optionId = allowOnceOption?.optionId ?? request.options[0]?.optionId ?? "";
+              return { outcome: { outcome: "selected" as const, optionId } };
+            }
+            if (permissionMode === "disabled") {
+              const rejectOption = request.options.find((option) => option.kind === "reject_once");
+              const optionId = rejectOption?.optionId ?? request.options[0]?.optionId ?? "";
+              return { outcome: { outcome: "selected" as const, optionId } };
+            }
+
+            const permissionRequest = parsePermissionRequest(request);
+            const requestId = ApprovalRequestId.make(crypto.randomUUID());
+            const runtimeRequestId = RuntimeRequestId.make(requestId);
+            const decision = yield* Deferred.make<ProviderApprovalDecision>();
+            pendingApprovals.set(requestId, { decision, kind: permissionRequest.kind });
+            yield* offerRuntimeEvent(
+              makeAcpRequestOpenedEvent({
+                stamp: yield* makeEventStamp(),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId: ctx?.activeTurnId,
+                requestId: runtimeRequestId,
+                permissionRequest,
+                detail:
+                  permissionRequest.detail ??
+                  (typeof request.toolCall?.title === "string"
+                    ? request.toolCall.title
+                    : "Permission request"),
+                args: request,
+                source: "acp.jsonrpc",
+                method: "session/request_permission",
+                rawPayload: request,
+              }),
             );
-            const allowOnceOption = request.options.find((option) => option.kind === "allow_once");
-            const optionId =
-              allowAlwaysOption?.optionId ??
-              allowOnceOption?.optionId ??
-              request.options[0]?.optionId;
+            const resolved = yield* Deferred.await(decision);
+            pendingApprovals.delete(requestId);
+            yield* offerRuntimeEvent(
+              makeAcpRequestResolvedEvent({
+                stamp: yield* makeEventStamp(),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId: ctx?.activeTurnId,
+                requestId: runtimeRequestId,
+                permissionRequest,
+                decision: resolved,
+              }),
+            );
             return {
-              outcome: {
-                outcome: "selected" as const,
-                optionId: optionId ?? "",
-              },
+              outcome:
+                resolved === "cancel"
+                  ? ({ outcome: "cancelled" } as const)
+                  : {
+                      outcome: "selected" as const,
+                      optionId: acpPermissionOutcome(resolved),
+                    },
             };
           }),
         );
@@ -227,6 +300,7 @@ export function makeDevinAdapter(
           acp,
           notificationFiber: undefined,
           turns: [],
+          pendingApprovals,
           activeTurnId: undefined,
           stopped: false,
         };
@@ -401,6 +475,7 @@ export function makeDevinAdapter(
     const interruptTurn: DevinAdapterShape["interruptTurn"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(threadId);
+        yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* Effect.ignore(
           ctx.acp.cancel.pipe(
             Effect.mapError((error) =>
@@ -410,14 +485,23 @@ export function makeDevinAdapter(
         );
       });
 
-    const respondToRequest: DevinAdapterShape["respondToRequest"] = () =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "respondToRequest",
-          detail: "Devin approval request handling is not yet supported.",
-        }),
-      );
+    const respondToRequest: DevinAdapterShape["respondToRequest"] = (
+      threadId,
+      requestId,
+      decision,
+    ) =>
+      Effect.gen(function* () {
+        const ctx = yield* requireSession(threadId);
+        const pending = ctx.pendingApprovals.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/request_permission",
+            detail: `Unknown pending approval request: ${requestId}`,
+          });
+        }
+        yield* Deferred.succeed(pending.decision, decision);
+      });
 
     const respondToUserInput: DevinAdapterShape["respondToUserInput"] = () =>
       Effect.fail(
