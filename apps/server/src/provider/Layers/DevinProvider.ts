@@ -10,7 +10,6 @@ import {
   DEFAULT_TIMEOUT_MS,
   buildServerProvider,
   detailFromResult,
-  extractAuthBoolean,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -25,7 +24,24 @@ const DEVIN_PRESENTATION = {
 } as const;
 
 const DEVIN_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
+  { slug: "adaptive", name: "Adaptive", isCustom: false, capabilities: null },
+  { slug: "claude-haiku-4.5", name: "Claude Haiku 4.5", isCustom: false, capabilities: null },
+  { slug: "claude-opus-4.5", name: "Claude Opus 4.5", isCustom: false, capabilities: null },
+  { slug: "claude-opus-4.6", name: "Claude Opus 4.6", isCustom: false, capabilities: null },
+  { slug: "claude-opus-4.7", name: "Claude Opus 4.7", isCustom: false, capabilities: null },
+  { slug: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", isCustom: false, capabilities: null },
+  { slug: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", isCustom: false, capabilities: null },
+  { slug: "deepseek-v4", name: "DeepSeek V4", isCustom: false, capabilities: null },
+  { slug: "gemini-3-flash", name: "Gemini 3 Flash", isCustom: false, capabilities: null },
+  { slug: "gemini-3.1-pro", name: "Gemini 3.1 Pro", isCustom: false, capabilities: null },
+  { slug: "glm-5.1", name: "GLM 5.1", isCustom: false, capabilities: null },
+  { slug: "gpt-5.2", name: "GPT 5.2", isCustom: false, capabilities: null },
+  { slug: "gpt-5.3-codex", name: "GPT 5.3 Codex", isCustom: false, capabilities: null },
+  { slug: "gpt-5.4", name: "GPT 5.4", isCustom: false, capabilities: null },
+  { slug: "gpt-5.4-mini", name: "GPT 5.4 Mini", isCustom: false, capabilities: null },
+  { slug: "gpt-5.5", name: "GPT 5.5", isCustom: false, capabilities: null },
   { slug: "kimi-k2.6", name: "Kimi K2.6", isCustom: false, capabilities: null },
+  { slug: "swe-1.5", name: "SWE 1.5", isCustom: false, capabilities: null },
   { slug: "swe-1.6", name: "SWE 1.6", isCustom: false, capabilities: null },
 ];
 
@@ -215,13 +231,10 @@ export const checkDevinProviderStatus = Effect.fn("checkDevinProviderStatus")(fu
   }
 
   const authResult = authProbe.success.value;
-  const isAuthenticated = yield* Effect.try({
-    try: () => {
-      const authJson = JSON.parse(authResult.stdout);
-      return extractAuthBoolean(authJson) ?? false;
-    },
-    catch: () => false,
-  }).pipe(Effect.orElseSucceed(() => false));
+  // `devin auth status` exits 0 when authenticated and non-zero when not.
+  // The CLI emits human-readable plain text rather than JSON, so the
+  // exit code is the authoritative signal.
+  const isAuthenticated = authResult.code === 0;
 
   if (!isAuthenticated) {
     return buildServerProvider({

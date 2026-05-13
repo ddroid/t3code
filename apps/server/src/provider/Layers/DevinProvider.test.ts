@@ -145,7 +145,7 @@ describe("checkDevinProviderStatus", () => {
             return { stdout: "devin version 1.0.0\n" };
           }
           if (args[0] === "auth" && args[1] === "status") {
-            return { stdout: JSON.stringify({ authenticated: true }) };
+            return { stdout: "Logged in (via Devin).\n" };
           }
           return { stdout: "" };
         }),
@@ -167,7 +167,7 @@ describe("checkDevinProviderStatus", () => {
             return { stdout: "", stderr: "devin version failed", code: 1 };
           }
           if (args[0] === "auth" && args[1] === "status") {
-            return { stdout: JSON.stringify({ authenticated: true }) };
+            return { stdout: "Logged in (via Devin).\n" };
           }
           return { stdout: "" };
         }),
@@ -175,7 +175,7 @@ describe("checkDevinProviderStatus", () => {
     ),
   );
 
-  it.effect("reports unauthenticated when auth says not logged in", () =>
+  it.effect("reports unauthenticated when auth exits non-zero", () =>
     Effect.gen(function* () {
       const snapshot = yield* checkDevinProviderStatus(decodeDevinSettings({}));
       assert.strictEqual(snapshot.installed, true);
@@ -189,7 +189,7 @@ describe("checkDevinProviderStatus", () => {
             return { stdout: "devin version 1.0.0\n" };
           }
           if (args[0] === "auth" && args[1] === "status") {
-            return { stdout: JSON.stringify({ authenticated: false }) };
+            return { stdout: "Not logged in.\n", stderr: "auth failed", code: 1 };
           }
           return { stdout: "" };
         }),
@@ -197,7 +197,7 @@ describe("checkDevinProviderStatus", () => {
     ),
   );
 
-  it.effect("reports unauthenticated when auth probe returns non-zero with invalid JSON", () =>
+  it.effect("reports unauthenticated for any non-zero auth exit code regardless of stdout", () =>
     Effect.gen(function* () {
       const snapshot = yield* checkDevinProviderStatus(decodeDevinSettings({}));
       assert.strictEqual(snapshot.installed, true);
@@ -212,7 +212,7 @@ describe("checkDevinProviderStatus", () => {
             return { stdout: "devin version 1.0.0\n" };
           }
           if (args[0] === "auth" && args[1] === "status") {
-            return { stdout: "not authenticated", stderr: "auth failed", code: 1 };
+            return { stdout: "random output", stderr: "", code: 2 };
           }
           return { stdout: "" };
         }),

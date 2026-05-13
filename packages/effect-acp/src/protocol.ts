@@ -87,6 +87,10 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const extPending = yield* Ref.make(
     new Map<string, Deferred.Deferred<unknown, AcpError.AcpError>>(),
   );
+  // Map incoming UUID request IDs to numeric BigInt IDs for RpcServer compatibility
+  const requestIdMap = yield* Ref.make(new Map<string, bigint>());
+  // Reverse map from numeric BigInt IDs back to original UUID strings for responses
+  const reverseRequestIdMap = yield* Ref.make(new Map<bigint, string>());
 
   const logProtocol = (event: AcpProtocolLogEvent) => {
     if (event.direction === "incoming" && !options.logIncoming) {
@@ -104,14 +108,24 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
   const offerOutgoing = Effect.fn("offerOutgoing")(function* (
     message: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded,
   ) {
+    // Denormalize request ID (convert numeric BigInt back to UUID) for outgoing messages
+    let denormalizedMessage = message;
+    if ("requestId" in message && typeof message.requestId === "string") {
+      const originalId = yield* denormalizeRequestId(message.requestId);
+      denormalizedMessage = { ...message, requestId: originalId };
+    } else if ("id" in message && typeof message.id === "string" && message.id !== "") {
+      const originalId = yield* denormalizeRequestId(message.id);
+      denormalizedMessage = { ...message, id: originalId };
+    }
+
     yield* logProtocol({
       direction: "outgoing",
       stage: "decoded",
-      payload: message,
+      payload: denormalizedMessage,
     });
 
     const encoded = yield* Effect.try({
-      try: () => parser.encode(message),
+      try: () => parser.encode(denormalizedMessage),
       catch: (cause) =>
         new AcpError.AcpProtocolParseError({
           detail: "Failed to encode ACP message",
@@ -249,6 +263,62 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
     );
   };
 
+  // Check if a string is a UUID (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+  const isUuid = (str: string): boolean =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
+
+  // Convert UUID request IDs to numeric BigInt IDs for RpcServer compatibility
+  const normalizeRequestId = (id: string): Effect.Effect<bigint> =>
+    Effect.gen(function* () {
+      console.log("[DEBUG normalizeRequestId] Input ID:", id, "isUUID:", isUuid(id));
+      if (isUuid(id)) {
+        const mapping = yield* Ref.get(requestIdMap);
+        if (mapping.has(id)) {
+          console.log("[DEBUG normalizeRequestId] Found existing mapping for:", id, "->", mapping.get(id)!);
+          return mapping.get(id)!;
+        }
+        // Generate a new numeric ID for this UUID
+        const numericId = yield* Ref.modify(
+          nextRequestId,
+          (current) => [current, current + 1n] as const,
+        );
+        yield* Ref.update(requestIdMap, (map) => new Map(map).set(id, numericId));
+        yield* Ref.update(reverseRequestIdMap, (map) => new Map(map).set(numericId, id));
+        console.log("[DEBUG normalizeRequestId] Created new mapping:", id, "->", numericId);
+        return numericId;
+      }
+      // Try to convert to BigInt if it's a numeric string
+      // Check if the string looks like a number first and is within safe BigInt range
+      if (/^\d+$/.test(id) && id.length < 20) {
+        console.log("[DEBUG normalizeRequestId] Converting numeric string:", id);
+        return yield* Effect.sync(() => BigInt(id));
+      }
+      // If conversion fails, generate a new numeric ID
+      const numericId = yield* Ref.modify(
+        nextRequestId,
+        (current) => [current, current + 1n] as const,
+      );
+      yield* Ref.update(requestIdMap, (map) => new Map(map).set(id, numericId));
+      yield* Ref.update(reverseRequestIdMap, (map) => new Map(map).set(numericId, id));
+      console.log("[DEBUG normalizeRequestId] Generated new ID for non-numeric:", id, "->", numericId);
+      return numericId;
+    });
+
+  // Convert numeric BigInt IDs back to original UUID strings for responses
+  const denormalizeRequestId = (id: string): Effect.Effect<string> =>
+    Effect.gen(function* () {
+      // Check if the string looks like a number before attempting conversion
+      if (/^\d+$/.test(id) && id.length < 20) {
+        const numericId = BigInt(id);
+        const reverseMap = yield* Ref.get(reverseRequestIdMap);
+        if (reverseMap.has(numericId)) {
+          return reverseMap.get(numericId)!;
+        }
+      }
+      // If no mapping exists or conversion fails, return the original ID
+      return id;
+    });
+
   const handleRequestEncoded = (message: RpcMessage.RequestEncoded) => {
     if (message.id === "") {
       if (message.tag === CLIENT_METHODS.session_update) {
@@ -305,7 +375,15 @@ export const makeAcpPatchedProtocol = Effect.fn("makeAcpPatchedProtocol")(functi
       );
     }
 
-    return Queue.offer(serverQueue, message).pipe(Effect.asVoid);
+    // Normalize request ID (convert UUID to BigInt) before passing to RpcServer
+    return normalizeRequestId(message.id).pipe(
+      Effect.flatMap((numericId) =>
+        Queue.offer(serverQueue, {
+          ...message,
+          id: String(numericId),
+        } satisfies RpcMessage.RequestEncoded).pipe(Effect.asVoid),
+      ),
+    );
   };
 
   const handleExitEncoded = (message: RpcMessage.ResponseExitEncoded) =>

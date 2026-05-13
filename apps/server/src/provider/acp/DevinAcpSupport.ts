@@ -49,7 +49,8 @@ export const makeDevinAcpRuntime = (
       AcpSessionRuntime.layer({
         ...input,
         spawn: buildDevinAcpSpawnInput(input.devinSettings, input.cwd, input.environment),
-        authMethodId: "devin_login",
+        authMethodId: "windsurf-api-key",
+        skipAuthenticate: true,
         clientCapabilities: {},
       }).pipe(
         Layer.provide(
